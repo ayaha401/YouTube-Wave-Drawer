@@ -87,25 +87,57 @@ class YouTubeWaveDrawer {
     this._analysisEnabled = false;
     this._toggleBtn       = null;
 
-    this._ready = false;
+    this._ready     = false;
+    this._initToken = 0;   // _tryInit() の並列実行を防ぐトークン
   }
 
   /* ── エントリポイント ─────────────────────────────── */
   start() {
     this._watchNavigation();
     this._tryInit();
+
+    // 最終フォールバック: イベント検知が全て失敗した場合でも
+    // ウォッチページで拡張機能が初期化されるよう 3 秒ごとに確認する。
+    // リロード直後に yt-navigate-finish を見逃した場合の回収手段。
+    setInterval(() => {
+      if (location.href.includes('/watch') && !document.getElementById(CONTAINER_ID)) {
+        this._tryInit();
+      }
+    }, 3000);
   }
 
   /* ── SPA ナビゲーション検知 ───────────────────────── */
   _watchNavigation() {
     let lastUrl = location.href;
-    new MutationObserver(() => {
-      if (location.href !== lastUrl) {
-        lastUrl = location.href;
-        this._teardown();
-        if (location.href.includes('/watch')) setTimeout(() => this._tryInit(), 1500);
-      }
-    }).observe(document.body, { childList: true, subtree: true });
+    let navTimer = null;
+
+    // URL変化・またはコンテナ消失を検知したときに teardown + tryInit を行う共通ハンドラ。
+    // 短時間に連続して発火しても debounce で 1 回にまとめる。
+    const onNavigate = () => {
+      const url = location.href;
+      const urlChanged  = url !== lastUrl;
+      const needsReinit = url.includes('/watch') && !document.getElementById(CONTAINER_ID);
+
+      // URL も変わらず、コンテナも正常に存在している → 何もしない
+      if (!urlChanged && !needsReinit) return;
+
+      lastUrl = url;
+      clearTimeout(navTimer);
+      navTimer = setTimeout(() => {
+        // URL が変化した場合のみ teardown（同一 URL リロードはコンテナが既に無いため不要）
+        if (urlChanged) this._teardown();
+        if (location.href.includes('/watch')) this._tryInit();
+      }, urlChanged ? 1000 : 500);
+    };
+
+    // MutationObserver: URL 変化を検知（SPA ナビゲーション）
+    new MutationObserver(() => onNavigate()).observe(document.body, { childList: true, subtree: true });
+
+    // yt-navigate-finish: YouTube SPA ナビゲーション完了イベント。
+    // リロード後に発火するが document_idle より前に発火することがあるため
+    // setInterval フォールバックも併用する。
+    // ※ forceReinit は使わず needsReinit チェックに統一する（不要な teardown を防ぐため）
+    document.addEventListener('yt-navigate-finish', () => onNavigate());
   }
 
   /* ── 動画要素・再生準備を待つ ─────────────────────── */
@@ -113,15 +145,18 @@ class YouTubeWaveDrawer {
     if (!location.href.includes('/watch')) return;
     if (document.getElementById(CONTAINER_ID)) return;
 
+    // トークンをインクリメントして古いループを無効化する。
+    // _tryInit() が重複呼び出しされた場合、最新のループだけが動作する。
+    const token    = ++this._initToken;
     const deadline = Date.now() + 20_000;
+
     const check = () => {
+      if (token !== this._initToken) return;   // 新しい tryInit が始まった → 中断
       if (Date.now() > deadline) return;
+      if (document.getElementById(CONTAINER_ID)) return;  // 別ループが先に完了
+
       const video = document.querySelector('video');
       if (video && video.readyState >= 2 && video.duration > 0) { this._setup(video); return; }
-      if (video && video.readyState < 1) {
-        video.addEventListener('loadedmetadata', () => this._tryInit(), { once: true });
-        return;
-      }
       setTimeout(check, 600);
     };
     check();
@@ -979,6 +1014,7 @@ class YouTubeWaveDrawer {
 
   /* ── クリーンアップ ───────────────────────────────── */
   _teardown() {
+    this._initToken++;   // 進行中の _tryInit() ループを中断させる
     this._scanActive = false;
 
     if (this._savedState && this._video) {
